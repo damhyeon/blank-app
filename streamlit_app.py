@@ -1,346 +1,350 @@
 # streamlit_app.py
-# 실행: streamlit run --server.port 3000 --server.address 0.0.0.0 streamlit_app.py
+"""
+Streamlit 대시보드 (한국어 UI)
+- 공개 데이터 대시보드: NASA GISS GISTEMP 월별 전지구 온도 이상치(Anomaly) CSV 사용
+    출처: https://data.giss.nasa.gov/gistemp/ 
+    직접 CSV 파일: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+- 사용자 입력 대시보드: 이 프롬프트의 'Input' 섹션에 데이터가 없을 경우 예시 데이터를 사용하여 동작 시연
+- 구현 규칙:
+    - date, value, group(optional) 표준화
+    - 결측/형변환/중복 처리
+    - 미래 날짜 제거 (로컬 시스템의 현재 날짜 기준)
+    - @st.cache_data 사용
+    - 전처리된 표 CSV 다운로드 제공
+- 비고: kaggle API 사용 시 별도 인증 안내를 주석으로 추가 (본 코드에서는 kaggle 사용하지 않음)
+"""
 
-import numpy as np
+from io import StringIO
+import requests
 import pandas as pd
-import xarray as xr
-import matplotlib.pyplot as plt
-from matplotlib.colors import TwoSlopeNorm
-from matplotlib import cm
+import numpy as np
+import datetime
+import time
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from dateutil import parser as dateparse
+from requests.adapters import HTTPAdapter, Retry
 
-# 🔵 Cartopy
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
+# -------------------------
+# 기본 설정 (한국어 UI)
+# -------------------------
+st.set_page_config(page_title="데이터 대시보드 (Streamlit + Codespaces)", layout="wide")
 
-# 🔤 한글 폰트 (Pretendard-Bold.ttf)
-from matplotlib import font_manager as fm, rcParams
-from pathlib import Path
-font_path = Path("fonts/Pretendard-Bold.ttf").resolve()
-if font_path.exists():
-    fm.fontManager.addfont(str(font_path))
-    font_prop = fm.FontProperties(fname=str(font_path))
-    rcParams["font.family"] = font_prop.get_name()
-else:
-    font_prop = fm.FontProperties()
-rcParams["axes.unicode_minus"] = False
-
-# -------------------------------------------------
-# ✅ ERDDAP: SOEST Hawaii 인스턴스 한 곳만 사용 (고정)
-#   - OISST v2.1 (AVHRR) anomaly 포함
-#   - 이 인스턴스는 현재 2024-12-31까지 제공됨
-# -------------------------------------------------
-ERDDAP_URL = "https://erddap.aoml.noaa.gov/hdb/erddap/griddap/SST_OI_DAILY_1981_PRESENT_T"
-
-def _open_ds(url_base: str):
-    """서버 설정에 따라 .nc 필요할 수 있어 두 번 시도 (동일 엔드포인트 고정)."""
-    try:
-        return xr.open_dataset(url_base, decode_times=True)
-    except Exception:
-        return xr.open_dataset(url_base + ".nc", decode_times=True)
-
-def _standardize_anom_field(ds: xr.Dataset, target_time: pd.Timestamp) -> xr.DataArray:
-    """
-    - 변수: 'anom'
-    - 깊이 차원(있다면): 표층 선택
-    - 좌표명: latitude/longitude → lat/lon 통일
-    - 시간: 데이터 커버리지 바깥이면 경계로 클램프 후 'nearest'
-    """
-    da = ds["anom"]
-
-    # 깊이 차원 표층 선택
-    for d in ["zlev", "depth", "lev"]:
-        if d in da.dims:
-            da = da.sel({d: da[d].values[0]})
-            break
-
-    # 시간 클램프 + nearest (멀리 점프 방지)
-    times = pd.to_datetime(ds["time"].values)
-    tmin, tmax = times.min(), times.max()
-    if target_time < tmin:
-        target_time = tmin
-    elif target_time > tmax:
-        target_time = tmax
-    da = da.sel(time=target_time, method="nearest").squeeze(drop=True)
-
-    # 좌표명 통일
-    rename_map = {}
-    if "latitude" in da.coords:  rename_map["latitude"]  = "lat"
-    if "longitude" in da.coords: rename_map["longitude"] = "lon"
-    if rename_map:
-        da = da.rename(rename_map)
-
-    return da
-
-# -----------------------------
-# 데이터 접근 (SOEST만 사용)
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def list_available_times() -> pd.DatetimeIndex:
-    ds = _open_ds(ERDDAP_URL)
-    times = pd.to_datetime(ds["time"].values)
-    ds.close()
-    return pd.DatetimeIndex(times)
-
-@st.cache_data(show_spinner=True)
-def load_anomaly(date: pd.Timestamp, bbox=None) -> xr.DataArray:
-    """
-    선택 날짜의 anomaly(°C) 2D 필드 반환.
-    bbox=(lat_min, lat_max, lon_min, lon_max); 경도 -180~180.
-    날짜 변경선 횡단 시 자동 분할-결합.
-    """
-    ds = _open_ds(ERDDAP_URL)
-    da = _standardize_anom_field(ds, date)
-
-    # bbox 슬라이스
-    if bbox is not None:
-        lat_min, lat_max, lon_min, lon_max = bbox
-
-        # 위도
-        if lat_min <= lat_max:
-            da = da.sel(lat=slice(lat_min, lat_max))
-        else:
-            da = da.sel(lat=slice(lat_max, lat_min))
-
-        # 경도 (+ 날짜변경선 처리)
-        if lon_min <= lon_max:
-            da = da.sel(lon=slice(lon_min, lon_max))
-        else:
-            left  = da.sel(lon=slice(lon_min, 180))
-            right = da.sel(lon=slice(-180, lon_max))
-            da = xr.concat([left, right], dim="lon")
-
-    ds.close()
-    return da
-
-# -----------------------------
-# Cartopy Plot
-# -----------------------------
-def plot_cartopy_anomaly(
-    da: xr.DataArray,
-    title: str,
-    vabs: float = 5.0,
-    projection=ccrs.Robinson(),
-    extent=None,
-):
-    fig = plt.figure(figsize=(12.5, 6.5))
-    ax = plt.axes(projection=projection)
-
-    ax.add_feature(cfeature.LAND, facecolor="lightgray", zorder=0)
-    ax.add_feature(cfeature.COASTLINE, linewidth=0.6, zorder=3)
-    ax.add_feature(cfeature.BORDERS, linewidth=0.4, zorder=3)
-
-    if extent is not None:
-        lon_min, lon_max, lat_min, lat_max = extent
-        ax.set_extent([lon_min, lon_max, lat_min, lat_max], crs=ccrs.PlateCarree())
-    else:
-        ax.set_global()
-
-    cmap = cm.get_cmap("RdBu_r").copy()
-    norm = TwoSlopeNorm(vmin=-vabs, vcenter=0.0, vmax=vabs)
-
-    if "lon" in da.coords:
-        da = da.sortby("lon")
-
-    im = ax.pcolormesh(
-        da["lon"], da["lat"], da.values,
-        transform=ccrs.PlateCarree(),
-        cmap=cmap, norm=norm, shading="auto", zorder=2
-    )
-
-    cbar = plt.colorbar(im, ax=ax, orientation="horizontal", pad=0.03, fraction=0.04, shrink=0.9)
-    cbar.set_label("해수면 온도 편차 (°C, 1971–2000 기준)", fontproperties=font_prop)
-
-    ax.set_title(title, pad=8, fontproperties=font_prop)
-    fig.tight_layout()
-    return fig
-
-# -----------------------------
-# UI
-# -----------------------------
-st.sidebar.header("🛠️ 보기 옵션")
-
-# 날짜 범위 = SOEST 실제 커버리지로 제한
-with st.spinner("사용 가능한 날짜 불러오는 중..."):
-    times = list_available_times()
-tmin, tmax = times.min().date(), times.max().date()
-
-# ✅ 기본 시작일 = 2024-08-15 (커버리지 범위 바깥이면 자동 조정)
-DEFAULT_START = pd.Timestamp("2024-08-15")
-if DEFAULT_START.date() < tmin:
-    default_date = times[0]
-elif DEFAULT_START.date() > tmax:
-    default_date = times[-1]
-else:
-    default_date = DEFAULT_START
-
-date = st.sidebar.date_input(
-    "날짜 선택",
-    value=default_date.date(),
-    min_value=tmin,
-    max_value=tmax,
-)
-date = pd.Timestamp(date)
-
-# 영역 프리셋
-preset = st.sidebar.selectbox(
-    "영역 선택",
-    [
-        "전 지구",
-        "동아시아(한국 포함)",
-        "북서태평양(일본-한반도)",
-        "북대서양(미 동부~유럽)",
-        "남태평양(적도~30°S)",
-    ],
-    index=0,
-)
-
-bbox_dict = {
-    "전 지구": None,
-    "동아시아(한국 포함)": (5, 55, 105, 150),
-    "북서태평양(일본-한반도)": (20, 55, 120, 170),
-    "북대서양(미 동부~유럽)": (0, 70, -80, 20),
-    "남태평양(적도~30°S)": (-30, 5, 140, -90),  # 날짜변경선 횡단 예시
-}
-bbox = bbox_dict[preset]
-
-# 색상 범위
-vabs = st.sidebar.slider("색상 범위 절대값 (±°C)", 2.0, 8.0, 5.0, 0.5)
-
-# 투영
-proj_name = st.sidebar.selectbox("투영(화면)", ["Robinson", "PlateCarree", "Mollweide"])
-if proj_name == "Robinson":
-    projection = ccrs.Robinson()
-elif proj_name == "Mollweide":
-    projection = ccrs.Mollweide()
-else:
-    projection = ccrs.PlateCarree()
-
-# -----------------------------
-# 데이터 로드 & 시각화
-# -----------------------------
-with st.spinner("SOEST ERDDAP에서 지도 데이터를 불러오는 중..."):
-    try:
-        da = load_anomaly(date, bbox=bbox)
-    except Exception as e:
-        st.error(f"데이터 로드 실패: {e}")
-        st.stop()
-
-actual_date = pd.to_datetime(da["time"].values).date()
-st.success(f"가져온 실제 날짜: {actual_date} (데이터 커버리지: {tmin} ~ {tmax})")
-
-extent = None if bbox is None else (bbox[2], bbox[3], bbox[0], bbox[1])
-title = f"OISST v2.1 해수면 온도 편차 (°C) · {preset} · {actual_date} · {proj_name}"
-
-fig = plot_cartopy_anomaly(da, title, vabs=vabs, projection=projection, extent=extent)
-st.pyplot(fig, clear_figure=True)
-
-# -----------------------------
-# 통계 & 다운로드
-# -----------------------------
-c1, c2, c3 = st.columns(3)
-c1.metric("평균 편차 (°C)", f"{np.nanmean(da.values):+.2f}")
-c2.metric("최대 편차 (°C)", f"{np.nanmax(da.values):+.2f}")
-c3.metric("최소 편차 (°C)", f"{np.nanmin(da.values):+.2f}")
-
-with st.expander("픽셀 데이터(샘플) 보기"):
-    sample = da.coarsen(lat=4, lon=4, boundary="trim").mean()
-    df_sample = sample.to_dataframe(name="anom(°C)").reset_index()
-    # 🔑 NaN 값 제거
-    df_sample = df_sample.dropna(subset=["anom(°C)"])
-    st.dataframe(df_sample.head(200), use_container_width=True)
-
-# 🔑 CSV도 NaN 제거
-df_csv = da.to_dataframe(name="anom(°C)").reset_index()
-df_csv = df_csv.dropna(subset=["anom(°C)"])
-
-if df_csv.empty:
-    st.warning("이 날짜/영역에는 유효한 anomaly 값이 없어 CSV가 비어 있습니다.")
-else:
-    csv_bytes = df_csv.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "📥 현재 지도 데이터(CSV) 내려받기",
-        data=csv_bytes,
-        file_name=f"oisst_anom_{actual_date}_{preset}_{proj_name}.csv",
-        mime="text/csv",
-    )
-
-# -----------------------------
-# 📘 데이터 탐구 보고서 (학생용)
-# -----------------------------
-st.markdown("---")
-st.header("📘 데이터 탐구 보고서: 우리 모둠의 발견")
-
-st.subheader("1. 대한민국 주변 바다가 보여준 이상 신호")
-st.markdown("""
-2024년 8월 15일 기준 해수면 온도 편차 지도를 보면, 대한민국 주변 바다가 
-세계적으로도 뚜렷한 **수온 상승의 핫스팟**으로 나타났습니다.  
-동중국해, 대한해협, 동해 남부 해역 일대가 기준치보다 훨씬 높은 온도를 기록하며 
-빨간색 영역으로 두드러졌습니다.  
-이것은 우리 생활권과 직접 연결된 바다가 기후 위기의 최전선에 놓여 있음을 의미합니다.
-""")
-
-st.subheader("2. 해수온도 상승의 주요 원인")
-st.markdown("""
-첫째, **온실가스 배출 증가**로 인한 지구 온난화가 바다에 축적된 열을 키우고 있습니다.  
-바다는 대기에서 발생한 초과 에너지의 90% 이상을 흡수하기 때문에, 
-인간이 배출한 이산화탄소와 메탄이 결국 바다 온도를 밀어올리고 있습니다.  
-
-둘째, **북태평양 해류와 대기 순환의 변화**가 한국 인근 해역을 특히 민감하게 만들었습니다.  
-적도 부근에서 발생한 해양 열파(마린 히트웨이브)가 북상하면서 
-한반도 주변 바다에 강한 온도 이상을 일으킨 것입니다.
-""")
-
-st.subheader("3. 해수온도 상승이 불러온 영향")
-st.markdown("""
-해수면 온도의 급격한 상승은 단순히 바닷물이 따뜻해지는 현상에 그치지 않습니다.  
-
-- **어장 붕괴와 어종 이동**: 명태, 오징어 같은 냉수성 어종은 급격히 줄고, 
-  대신 열대성 어종이 나타나며 어업 구조 자체가 변하고 있습니다.  
-
-- **태풍의 위력 강화**: 따뜻한 바다는 태풍의 에너지원이 되기 때문에, 
-  여름철 한반도를 향하는 태풍은 더욱 강력해지고 그 피해 규모도 커지고 있습니다.  
-
-- **집중호우와 참사**: 바다에서 증발한 수증기가 많아질수록 
-  대기 중 수분이 과도하게 축적되어 집중호우를 일으킵니다.  
-  최근 우리나라에서 발생한 도시 침수, 산사태 같은 참사는 
-  해수온도 상승과 무관하지 않으며, 이는 기후 위기가 
-  인명 피해와 사회적 재난으로 직결되고 있음을 보여줍니다.  
-
-- **연안 생태계 교란**: 해양 산성화와 함께, 산호 군락이나 해조류 숲 같은 
-  연안 생태계가 무너지고 이는 다시 해양 생물 다양성 감소로 이어집니다.  
-
-이러한 변화는 곧 우리의 식량, 안전, 지역 사회의 경제와 직결된다는 점에서 
-단순히 환경 문제가 아닌 **생존의 문제**라고 할 수 있습니다.
-""")
-
-
-# -----------------------------
-# 📚 참고자료
-# -----------------------------
-st.markdown("---")
-
-st.markdown("""
-### 📚 참고문헌
-
-- NOAA National Centers for Environmental Information. (2019). *Optimum interpolation sea surface temperature (OISST) v2.1 daily high resolution dataset* [Data set]. NOAA National Centers for Environmental Information. https://www.ncei.noaa.gov/products/optimum-interpolation-sst  
-
-- NOAA Atlantic Oceanographic and Meteorological Laboratory (AOML). (2025). *ERDDAP server: SST_OI_DAILY_1981_PRESENT_T (OISST v2.1, daily, 1981–present)* [Data set]. NOAA AOML. https://erddap.aoml.noaa.gov/hdb/erddap/info/SST_OI_DAILY_1981_PRESENT_T/index.html  
-
-- 그레타 툰베리, 《기후 책》, 이순희 역, 기후변화행동연구소 감수, 열린책들, 2023.  
-    ([Yes24 도서 정보 링크](https://www.yes24.com/product/goods/119700330))
-""")
-
-
-
-# -----------------------------
-# Footer (팀명)
-# -----------------------------
+# Pretendard 폰트 적용 시도 (있으면 적용, 없으면 무시)
 st.markdown(
     """
-    <div style='text-align: center; padding: 20px; color: gray; font-size: 0.9em;'>
-        미림마이스터고 1학년 4반 3조 · 너무뜨거운바다조
-    </div>
+    <style>
+    @font-face {
+        font-family: 'Pretendard';
+        src: url('/fonts/Pretendard-Bold.ttf') format('truetype');
+        font-weight: 700;
+        font-style: normal;
+    }
+    html, body, [class*="css"]  {
+        font-family: 'Pretendard', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    }
+    </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
+
+st.title("📊 데이터 대시보드 — 공개 데이터 + 사용자 입력 데이터 (한국어 UI)")
+st.caption("공개 데이터: NASA GISS GISTEMP (전지구 월별 온도 이상치). 사용자 입력 데이터: 프롬프트 Input 섹션 기반 (없으면 예시 사용).")
+
+# 유틸: 현재 로컬 날짜(앱이 실행되는 머신 시간)
+TODAY = datetime.datetime.now().date()
+
+# -------------------------
+# 헬퍼 함수: 안전한 HTTP 가져오기 (재시도 + 대체 데이터)
+# -------------------------
+def requests_get_with_retry(url, max_retries=3, backoff=1.0, timeout=15):
+    session = requests.Session()
+    retries = Retry(total=max_retries, backoff_factor=backoff, status_forcelist=[429,500,502,503,504])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
+    session.mount("http://", HTTPAdapter(max_retries=retries))
+    resp = session.get(url, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+@st.cache_data(show_spinner=False)
+def fetch_gistemp_csv(url="https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv"):
+    """
+    NASA GISTEMP CSV를 시도해 가져온다.
+    실패 시 None 반환 (호출부에서 예시 데이터로 자동 대체)
+    출처 주석: https://data.giss.nasa.gov/gistemp/ , CSV: https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+    """
+    try:
+        resp = requests_get_with_retry(url)
+        resp.encoding = 'utf-8'
+        text = resp.text
+        return text
+    except Exception as e:
+        # 재시도 이미 수행. 여기서 실패하면 None 반환
+        return None
+
+# -------------------------
+# 공개 데이터 대시보드: NASA GISTEMP 가져오기 -> 전처리
+# -------------------------
+st.header("1. 공개 데이터 대시보드 — NASA GISS (GISTEMP)")
+
+with st.expander("데이터 원본 / 처리설명 (클릭해서 보기)", expanded=False):
+    st.markdown("""
+    - 데이터 출처: NASA GISS GISTEMP (월별 전지구 평균 온도 이상치)
+      - 메인 페이지: https://data.giss.nasa.gov/gistemp/
+      - CSV 파일(공식): https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv
+    - 본 앱은 CSV 직접 가져와 전처리 (결측/중복/형변환/미래 날짜 제거) 후 시각화합니다.
+    - 만약 원격 CSV 호출 실패 시 자동으로 예시(대체) 데이터로 전환하며, 화면에 안내 메시지를 표시합니다.
+    - (참고) kaggle API 사용법이 필요한 경우 별도 안내 필요합니다. 이 샘플은 kaggle을 사용하지 않습니다.
+    """)
+
+raw_text = fetch_gistemp_csv()
+using_example_public = False
+
+if raw_text is None:
+    using_example_public = True
+    st.warning("공개 데이터(GISTEMP) 다운로드에 실패했습니다. 예시 데이터로 대체하여 표시합니다. (원인: 네트워크 또는 원격 서버 차단)")
+    # 간단 예시 데이터 (연-월, anomaly)
+    example_public_csv = """Year,Jan,Feb,Mar,Apr,May,Jun,Jul,Aug,Sep,Oct,Nov,Dec,Annual
+    2020,0.92,0.79,0.98,0.91,0.85,0.84,0.90,0.86,0.76,0.84,0.89,0.95,0.86
+    2021,0.98,0.76,0.85,1.02,0.92,0.88,0.95,0.90,0.80,0.88,0.94,0.99,0.90
+    2022,1.05,0.92,1.10,1.12,1.03,0.98,1.00,0.99,0.88,0.96,1.02,1.08,1.03
+    2023,1.12,1.00,1.15,1.20,1.10,1.05,1.08,1.02,0.95,1.03,1.09,1.14,1.08
+    """
+    raw_text = example_public_csv
+
+# 파싱: NASA CSV 파일은 년도 행 + 12개월 열 + 연평균 열 구조
+def parse_gistemp_table(text):
+    """
+    GISTEMP의 tabledata_v4 CSV/텍스트 포맷을 파싱하여
+    date,value (월별) 표준형으로 반환.
+    """
+    # 일부 GISTEMP 파일은 헤더 또는 주석 라인으로 시작. Pandas로 읽어보고, 해를 년도 컬럼으로 사용.
+    try:
+        df = pd.read_csv(StringIO(text), skiprows=0)
+    except Exception:
+        # fallback: try different encoding/sep
+        df = pd.read_csv(StringIO(text))
+    # Expect columns like 'Year','Jan','Feb',...,'Dec', 'Annual'
+    cols = df.columns.tolist()
+    # normalize column names
+    df.columns = [c.strip() for c in cols]
+    month_cols = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+    available_months = [m for m in month_cols if m in df.columns]
+    records = []
+    for _, row in df.iterrows():
+        year = int(row['Year'])
+        for i, mon in enumerate(available_months, start=1):
+            raw_val = row.get(mon, np.nan)
+            try:
+                val = float(raw_val)
+            except Exception:
+                val = np.nan
+            # create date
+            try:
+                date = datetime.date(year, i, 1)
+            except Exception:
+                continue
+            records.append({'date': pd.to_datetime(date), 'value': val})
+    df_long = pd.DataFrame.from_records(records)
+    # 정렬, 중복 제거
+    df_long = df_long.drop_duplicates(subset=['date']).sort_values('date').reset_index(drop=True)
+    return df_long
+
+public_df = parse_gistemp_table(raw_text)
+
+# 전처리: 결측 처리(보간), 형변환, 미래 날짜 제거
+def preprocess_timeseries(df):
+    df = df.copy()
+    # ensure date column is datetime
+    df['date'] = pd.to_datetime(df['date'])
+    # remove future dates (strictly greater than TODAY)
+    df = df[df['date'].dt.date <= TODAY]
+    # sort
+    df = df.sort_values('date').reset_index(drop=True)
+    # duplicate removal
+    df = df.drop_duplicates(subset=['date'])
+    # ensure numeric
+    df['value'] = pd.to_numeric(df['value'], errors='coerce')
+    # simple interpolation for missing values (linear)
+    if df['value'].isna().any():
+        df['value'] = df['value'].interpolate(method='time', limit_direction='both')
+    return df
+
+public_df = preprocess_timeseries(public_df)
+
+# 다운로드 버튼 제공을 위한 CSV
+public_csv_bytes = public_df.to_csv(index=False).encode('utf-8')
+
+# 공개 데이터 시각화 UI (사이드바 컨트롤)
+st.subheader("공개 데이터: 전지구 월별 온도 이상치 (GISTEMP)")
+with st.sidebar.expander("공개 데이터 설정 (GISTEMP)", expanded=True):
+    st.write("데이터 소스: NASA GISS GISTEMP (월별)")
+    show_smoothing = st.checkbox("이동평균 적용 (3개월)", value=True)
+    avg_window = st.number_input("이동평균 기간 (개월)", min_value=1, max_value=24, value=3, step=1)
+    chart_kind = st.radio("차트 종류", options=["꺾은선그래프", "면적그래프", "바 차트"], index=0)
+    include_annual = st.checkbox("연평균(연도별) 라인 표시", value=False)
+
+# 기본 차트 (Plotly)
+if public_df.empty:
+    st.error("공개 데이터가 비어있습니다.")
+else:
+    df_plot = public_df.copy()
+    if show_smoothing and avg_window > 1:
+        df_plot['smoothed'] = df_plot['value'].rolling(window=avg_window, min_periods=1, center=True).mean()
+        y_col = 'smoothed'
+    else:
+        y_col = 'value'
+
+    fig = go.Figure()
+    if chart_kind == "꺾은선그래프":
+        fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot[y_col], mode='lines+markers', name='월별 이상치'))
+    elif chart_kind == "면적그래프":
+        fig.add_trace(go.Scatter(x=df_plot['date'], y=df_plot[y_col], mode='lines', fill='tozeroy', name='월별 이상치(면적)'))
+    else:
+        fig = px.bar(df_plot, x='date', y=y_col, labels={'date':'날짜','value':'이상치 (°C)'})
+    # 연평균 라인 계산 및 표시 (옵션)
+    if include_annual:
+        df_plot['year'] = df_plot['date'].dt.year
+        annual = df_plot.groupby('year')[y_col].mean().reset_index()
+        # convert year to date at mid-year for plotting
+        annual['date'] = pd.to_datetime(annual['year'].astype(str) + '-07-01')
+        fig.add_trace(go.Scatter(x=annual['date'], y=annual[y_col], mode='lines+markers', name='연평균', line=dict(dash='dash', width=2)))
+    fig.update_layout(title="전지구 월별 온도 이상치 (NASA GISTEMP)",
+                      xaxis_title="날짜",
+                      yaxis_title="이상치 (°C)",
+                      hovermode='x unified',
+                      legend_title_text='항목')
+    st.plotly_chart(fig, use_container_width=True)
+
+# 공개 데이터 테이블 + CSV 다운로드
+with st.expander("전처리된 공개 데이터 표 / CSV 다운로드", expanded=False):
+    st.dataframe(public_df.tail(50))
+    st.download_button(label="전처리된 공개 데이터 CSV 다운로드", data=public_csv_bytes, file_name="gistemp_preprocessed.csv", mime="text/csv")
+
+# -------------------------
+# 사용자 입력 대시보드
+# -------------------------
+st.header("2. 사용자 입력 대시보드 (프롬프트 Input 섹션 기반)")
+
+# 이 프롬프트의 Input 섹션이 비어있는 것으로 가정. 앱은 실행 중 파일 업로드나 텍스트 입력을 요구하지 않음.
+# 따라서 'Input'이 제공되지 않았을 때 사용할 예시 사용자 데이터를 내부 포함.
+# (만약 사용자가 이후 Input을 제공하면 본 코드를 수정하여 해당 CSV 텍스트를 여기에 직접 붙여넣도록 함)
+
+# 예시 사용자 데이터 (date, value, group)
+# - 사용자는 본 예시 대신 자신의 CSV/이미지/설명을 Input 섹션에 제공할 수 있음.
+example_user_csv = """date,value,group
+2023-01-01,120,A
+2023-02-01,130,A
+2023-03-01,125,A
+2023-01-01,50,B
+2023-02-01,55,B
+2023-03-01,60,B
+2023-04-01,70,B
+2024-05-01,80,A
+2025-10-01,999,A
+"""
+
+# NOTE: 위 데이터에는 미래(예: 2025-10-01) 샘플이 있어 전처리에서 제거됨(로컬 현재일 기준)
+user_df = pd.read_csv(StringIO(example_user_csv))
+# 전처리 사용자 데이터 (표준화)
+def preprocess_user_df(df):
+    df = df.copy()
+    # 표준 컬럼 확인/대응
+    if 'date' not in df.columns:
+        # 시도: 첫 컬럼을 date로 가정
+        df = df.rename(columns={df.columns[0]:'date'})
+    if 'value' not in df.columns:
+        # 시도: 두번째 컬럼을 value로 가정
+        if len(df.columns) >= 2:
+            df = df.rename(columns={df.columns[1]:'value'})
+    # parse date
+    df['date'] = pd.to_datetime(df['date'], errors='coerce')
+    df = df.dropna(subset=['date'])
+    # remove future dates
+    df = df[df['date'].dt.date <= TODAY]
+    # numeric value
+    df['value'] = pd.to_numeric(df['value'], errors='coerce')
+    # fill group if missing
+    if 'group' not in df.columns:
+        df['group'] = '기본'
+    df = df.drop_duplicates(subset=['date','group'])
+    # missing interpolation per group (time-based)
+    df = df.sort_values(['group','date']).reset_index(drop=True)
+    df['value'] = df.groupby('group')['value'].apply(lambda s: s.interpolate(method='time', limit_direction='both'))
+    return df
+
+user_df = preprocess_user_df(user_df)
+
+# 사이드바: 사용자 데이터 관련 자동 구성
+with st.sidebar.expander("사용자 데이터 설정", expanded=False):
+    st.write("사용자 입력 데이터는 이 프롬프트의 Input 섹션에서 제공한 CSV/이미지/설명만 사용합니다.")
+    smoothing_user = st.checkbox("사용자 데이터 이동평균(기간 선택)", value=True)
+    user_window = st.slider("이동평균 기간(개월)", 1, 12, 3)
+
+if user_df.empty:
+    st.warning("사용자 입력 데이터가 존재하지 않습니다. (Input 섹션에 데이터를 추가하면 해당 데이터로 대시보드가 구성됩니다.)")
+    st.info("현재는 내장 예시 데이터를 사용 중입니다.")
+else:
+    st.subheader("사용자 데이터 시각화 (예시)")
+    # 집단(group) 수에 따라 자동으로 차트 선택
+    groups = user_df['group'].unique()
+    if len(groups) == 1:
+        # 단일 시계열 -> 꺾은선/면적
+        df_u = user_df.copy().sort_values('date')
+        if smoothing_user and user_window > 1:
+            df_u['smoothed'] = df_u['value'].rolling(window=user_window, min_periods=1, center=True).mean()
+            y_col = 'smoothed'
+        else:
+            y_col = 'value'
+        fig_u = px.line(df_u, x='date', y=y_col, markers=True, labels={'date':'날짜','value':'값'}, title="사용자 입력 시계열(단일 그룹)")
+        st.plotly_chart(fig_u, use_container_width=True)
+    else:
+        # 다중 그룹 -> 그룹별 꺾은선(범례) 또는 면적 누적
+        df_u = user_df.copy().sort_values('date')
+        if smoothing_user and user_window > 1:
+            df_u['smoothed'] = df_u.groupby('group')['value'].transform(lambda s: s.rolling(window=user_window, min_periods=1, center=True).mean())
+            y_col = 'smoothed'
+        else:
+            y_col = 'value'
+        fig_u = px.line(df_u, x='date', y=y_col, color='group', markers=True, labels={'date':'날짜','value':'값','group':'그룹'}, title="사용자 입력 시계열 (그룹별)")
+        st.plotly_chart(fig_u, use_container_width=True)
+
+    # 비율형 (group 합계 -> 도넛)
+    st.subheader("그룹별 합계 비율")
+    group_sum = user_df.groupby('group', as_index=False)['value'].sum()
+    fig_pie = px.pie(group_sum, values='value', names='group', hole=0.45, title="그룹별 값 비율 (도넛)")
+    st.plotly_chart(fig_pie, use_container_width=True)
+
+    # 지도 시각화: 만약 'lat' & 'lon' 열이 있으면 지도 자동 구성
+    if {'lat','lon'}.issubset(user_df.columns):
+        st.subheader("위치 기반 시각화 (지도)")
+        map_df = user_df.dropna(subset=['lat','lon'])
+        st.map(map_df.rename(columns={'lat':'latitude','lon':'longitude'})[['latitude','longitude']])
+    else:
+        st.info("사용자 데이터에 'lat' 및 'lon' 열이 없으므로 지도 시각화는 생략합니다.")
+
+    # 사용자 데이터 표 + 다운로드
+    st.subheader("전처리된 사용자 데이터 표 / CSV 다운로드")
+    st.dataframe(user_df)
+    st.download_button("사용자 데이터 CSV 다운로드", data=user_df.to_csv(index=False).encode('utf-8'), file_name="user_data_preprocessed.csv", mime="text/csv")
+
+# -------------------------
+# 추가 도구 & 도움말 섹션
+# -------------------------
+st.markdown("---")
+st.header("도움말 및 추가 안내 (간단 요약)")
+
+st.markdown("""
+- 공개 데이터는 NASA GISS GISTEMP의 공식 CSV를 시도하여 불러옵니다.
+  - CSV URL: `https://data.giss.nasa.gov/gistemp/tabledata_v4/GLB.Ts+dSST.csv`
+  - (참고) 다운로드 실패 시 예시 데이터로 자동 대체하고 화면에 안내합니다.
+- 사용자 데이터: 이 프롬프트의 Input 섹션에서 제공된 파일/텍스트만 사용합니다. 현재 Input이 비어있어 내장 예시 데이터로 동작 시연합니다.
+- kaggle API 사용 안내 (참고)
+  1. Kaggle 계정 생성 후 API 토큰(kaggle.json) 다운로드
+  2. Codespaces / 로컬 환경에 `~/.kaggle/kaggle.json`으로 위치시킵니다.
+  3. `pip install kaggle` 후 `kaggle datasets download -d <dataset>` 사용.
+  4. 보안상 토큰은 공개 저장소에 올리지 마세요.
+""")
+
+st.caption("앱 버전: Streamlit + GitHub Codespaces 데모 — 모든 라벨/버튼은 한국어로 작성되었습니다.")
