@@ -57,6 +57,50 @@ def calculate_paired_stats(pre_data, post_data):
         '95% CI 하한': ci_low,
         '95% CI 상한': ci_high,
     }
+    
+def get_globe_figure():
+    """Plotly를 사용하여 지구본 시각화(더미 데이터)를 생성하는 함수"""
+    # 더미 데이터 생성
+    # 예시: 해수면 상승 데이터를 위도, 경도, 높이(Z)로 표현
+    lats = np.random.uniform(-90, 90, 100)
+    lons = np.random.uniform(-180, 180, 100)
+    # z 값은 해수면 상승량(예: 0~100mm)을 나타낸다고 가정
+    z = np.random.uniform(0, 100, 100)
+    
+    fig = go.Figure(data=go.Mesh3d(
+        # 지오메트리 데이터를 위해 위도, 경도, 높이(z)를 정의
+        x=lons,
+        y=lats,
+        z=z,
+        # 색상 및 투명도 설정
+        color='blue',
+        opacity=0.5,
+        # 표면 설정
+        intensity=z,
+        colorscale='Viridis',
+        lighting=dict(ambient=0.5, diffuse=0.5, specular=0.5)
+    ))
+
+    # 배경 이미지 추가 (선택 사항)
+    fig.add_trace(go.Surface(
+        z=[[0, 0], [0, 0]],
+        colorscale='Earth',
+        showscale=False,
+        surfacecolor=[[0, 0], [0, 0]]
+    ))
+    
+    # 레이아웃 설정
+    fig.update_layout(
+        title_text='<b>글로벌 해수면 상승 시뮬레이션</b>',
+        scene=dict(
+            xaxis=dict(showbackground=False, showticklabels=False, title=''),
+            yaxis=dict(showbackground=False, showticklabels=False, title=''),
+            zaxis=dict(showbackground=False, showticklabels=False, title=''),
+            aspectmode='data',
+        )
+    )
+    
+    return fig
 
 # --- 1. 앱 기본 설정 ---
 st.set_page_config(layout="wide", page_title="대응표본 t-검정 분석기")
@@ -130,7 +174,7 @@ st.title("📄 교육연구대회용 사전-사후 데이터 분석")
 st.subheader("대응표본 t-검정, 효과크기, 시각화 (문항/요인 단위 분석 지원)")
 
 if df_original is not None:
-    tab1, tab2 = st.tabs(["분석 결과", "시각화"])
+    tab1, tab2, tab3 = st.tabs(["분석 결과", "시각화", "지구본 시각화"])
 
     with tab1:
         st.header("📊 분석 결과 요약")
@@ -322,6 +366,12 @@ if df_original is not None:
                     st.markdown("---")
         else:
             st.info("분석 결과를 보려면 '분석 결과' 탭에서 분석을 먼저 실행해주세요.")
+    
+    with tab3:
+        st.header("🌍 글로벌 데이터 시뮬레이션")
+        st.markdown("<b>⚠️ 참고:</b> 이 지구본은 가상의 데이터를 사용하여 시뮬레이션된 것입니다.")
+        globe_fig = get_globe_figure()
+        st.plotly_chart(globe_fig, use_container_width=True)
             
 else:
     st.info("👈 사이드바에서 CSV 파일을 업로드하여 분석을 시작하세요.")
